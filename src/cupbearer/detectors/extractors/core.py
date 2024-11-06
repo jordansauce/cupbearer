@@ -189,6 +189,7 @@ class FeatureExtractor(ABC):
         self.global_processing_fn = global_processing_fn
         self.cache = cache
         self.set_model(model)
+        self.frozen = False
 
     @abstractmethod
     def compute_features(self, inputs) -> dict[str, torch.Tensor]:
@@ -221,3 +222,9 @@ class FeatureExtractor(ABC):
 
     def set_model(self, model: torch.nn.Module | None):
         self.model = model
+
+    def freeze(self):
+        self.frozen = True
+
+    def unfreeze(self):
+        self.frozen = False

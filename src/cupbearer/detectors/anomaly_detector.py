@@ -193,6 +193,9 @@ class AnomalyDetector(ABC):
             untrusted_data = task.untrusted_train_data
             self.set_model(task.model)
 
+        if self.feature_extractor is not None:
+            self.feature_extractor.unfreeze()
+
         dataloaders = []
         for data in [trusted_data, untrusted_data]:
             if data is None:
@@ -248,6 +251,9 @@ class AnomalyDetector(ABC):
             ), "dataset and test_loader must be None when passing a task"
             dataset = task.test_data
             self.set_model(task.model)
+
+        if self.feature_extractor is not None:
+            self.feature_extractor.freeze()
 
         test_loader = self.build_test_loaders(dataset, test_loader, batch_size)
         assert 0 < histogram_percentile <= 100

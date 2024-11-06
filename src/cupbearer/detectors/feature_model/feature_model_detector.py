@@ -91,6 +91,10 @@ class FeatureModelDetector(ActivationBasedDetector):
         | None = None,
         layer_aggregation: str = "mean",
         cache: FeatureCache | None = None,
+        get_grads: bool = False,
+        output_func_for_grads: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        act_grad_combination_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
     ):
         self.feature_model = feature_model
         super().__init__(
@@ -100,6 +104,9 @@ class FeatureModelDetector(ActivationBasedDetector):
             individual_processing_fn=individual_processing_fn,
             global_processing_fn=global_processing_fn,
             cache=cache,
+            get_grads=get_grads,
+            output_func_for_grads=output_func_for_grads,
+            act_grad_combination_func=act_grad_combination_func,
         )
 
     def _train(

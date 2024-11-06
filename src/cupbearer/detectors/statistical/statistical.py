@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from typing import Any, Callable
 
 import torch
 from einops import rearrange
@@ -78,9 +79,13 @@ class ActivationCovarianceBasedDetector(StatisticalDetector):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._means = {}
-        self._Cs = {}
-        self._ns = {}
+        self._means: dict[
+            str, dict[str, torch.Tensor]
+        ] = {}  # Means {case ('trusted' or 'untrusted): {name: (batch, dim) } }
+        self._Cs: dict[
+            str, dict[str, torch.Tensor]
+        ] = {}  # Covariance matrices (batch, dim, dim)
+        self._ns: dict[str, dict[str, int]] = {}  # number of samples
 
     def init_variables(
         self, activation_sizes: dict[str, torch.Size], device, case: str
@@ -181,4 +186,218 @@ class ActivationCovarianceBasedDetector(StatisticalDetector):
                 ):
                     raise RuntimeError("All zero covariance matrix detected.")
 
+            self.post_covariance_training(**kwargs)
+
+
+class BasisInvariantAttributionDetector(ActivationCovarianceBasedDetector):
+    def __init__(
+        self,
+        n_svals=10,
+        feature_extractor=None,
+        activation_names: list[str] | None = None,
+        individual_processing_fn: Callable[[torch.Tensor, Any, str], torch.Tensor]
+        | None = None,
+        global_processing_fn: Callable[
+            [dict[str, torch.Tensor]], dict[str, torch.Tensor]
+        ]
+        | None = None,
+        processed_names: list[str] | None = None,
+        cache=None,
+        output_func_for_grads: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        act_grad_combination_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
+        **kwargs,
+    ):
+        if act_grad_combination_func is None:
+
+            def stack_activations_and_grads(activations, grads):
+                return torch.stack((activations[..., -1, :], grads[..., -1, :]), dim=-1)
+
+            act_grad_combination_func = stack_activations_and_grads
+
+        if feature_extractor is None:
+            if activation_names is None:
+                raise ValueError(
+                    "Either a feature extractor or a list of activation names "
+                    "must be provided."
+                )
+            from cupbearer.detectors.extractors import GradientFeatureExtractor
+
+            feature_extractor = GradientFeatureExtractor(
+                names=activation_names,
+                individual_processing_fn=individual_processing_fn,
+                global_processing_fn=global_processing_fn,
+                processed_names=processed_names,
+                cache=cache,
+                output_func_for_grads=output_func_for_grads,
+                act_grad_combination_func=act_grad_combination_func,
+            )
+
+        super().__init__(
+            feature_extractor=feature_extractor,
+            activation_names=activation_names,
+            individual_processing_fn=individual_processing_fn,
+            global_processing_fn=global_processing_fn,
+            processed_names=processed_names,
+            cache=cache,
+            output_func_for_grads=output_func_for_grads,
+            act_grad_combination_func=act_grad_combination_func,
+            **kwargs,
+        )
+
+        self.n_svals = n_svals  # Number of singular vectors to keep
+        self._act_covs: dict[
+            str, dict[str, torch.Tensor]
+        ] = {}  # Covariance matrices (batch, dim, dim)
+        self._grad_covs_uncentered: dict[
+            str, dict[str, torch.Tensor]
+        ] = {}  # Uncentered gradient covariance matrices (batch, dim, dim)
+        self.projector_half_A: dict[str, dict[str, torch.Tensor]] = {}
+        self.projector_half_G: dict[str, dict[str, torch.Tensor]] = {}
+
+    def init_variables(
+        self, activation_sizes: dict[str, torch.Size], device, case: str
+    ):
+        act_sizes = {k: v[:-1] for k, v in activation_sizes.items()}
+        grad_sizes = {k: v[:-1] for k, v in activation_sizes.items()}
+        super().init_variables(act_sizes, device, case)
+        self._grad_covs_uncentered[case] = {
+            k: torch.zeros((size[-1], size[-1]), device=device)
+            for k, size in grad_sizes.items()
+        }
+
+    def update_grad_covs(self, grads: dict[str, torch.Tensor], case: str):
+        for k, grad in grads.items():
+            grad = rearrange(grad, "batch ... dim -> (batch ...) dim")
+            assert grad.ndim == 2, grad.shape
+            prev_factor = (self._ns[case][k] - grad.shape[0]) / self._ns[case][k]
+            new_factor = grad.shape[0] / self._ns[case][k]
+            self._grad_covs_uncentered[case][
+                k
+            ] = prev_factor * self._grad_covs_uncentered[case][
+                k
+            ] + new_factor * torch.einsum(
+                "bi,bj->ij", grad, grad
+            )
+
+    def update_projection_matrices(self, case: str):
+        assert self._Cs[case].keys() == self._grad_covs_uncentered[case].keys()
+        self.projector_half_A[case] = {}
+        self.projector_half_G[case] = {}
+        for k in self._Cs[case].keys():
+            act_cov = self._Cs[case][k] / (self._ns[case][k] - 1)
+
+            # Update projection matrices
+            A_vecs, A_vals, _ = torch.linalg.svd(act_cov, full_matrices=False)
+            G_vecs, G_vals, _ = torch.linalg.svd(
+                self._grad_covs_uncentered[case][k], full_matrices=False
+            )
+            A = A_vecs * A_vals.unsqueeze(-2) ** 0.5
+            G = G_vecs * G_vals.unsqueeze(-2) ** 0.5
+            U, S, Vh = torch.linalg.svd(G.mT @ A)
+            U = U[..., : self.n_svals]
+            S = S[..., : self.n_svals].unsqueeze(-2)
+            # S /= S.max(dim=-1, keepdim=True).values
+            S = S ** (-0.5)
+            V = Vh.mT[..., : self.n_svals]
+            self.projector_half_A[case][k] = A @ (V * S)  # default is S ** (-0.5)
+            self.projector_half_G[case][k] = G @ (U * S)  # default is S ** (-0.5)
+            # -0.5: 88.0, -2.0: 85.0, -1.0: 80.3, -3.0: 85.9, -0.6: 71.9, -0.4: 69.79
+
+    def batch_update(self, activations: dict[str, torch.Tensor], case: str):
+        acts = {k: v[..., 0] for k, v in activations.items()}
+        grads = {k: v[..., 1] for k, v in activations.items()}
+        super().batch_update(acts, case)
+        self.update_grad_covs(grads, case)
+
+    def _compute_layerwise_scores(self, inputs, features):
+        batch_size = next(iter(features.values())).shape[0]
+        features = {
+            k: rearrange(v, "batch ... dim isgrad -> (batch ...) dim isgrad")
+            for k, v in features.items()
+        }
+        scores = {
+            k: self._individual_layerwise_score(k, v) for k, v in features.items()
+        }
+        scores = {
+            k: rearrange(
+                v,
+                "(batch independent_dims) -> batch independent_dims",
+                batch=batch_size,
+            ).mean(-1)
+            for k, v in scores.items()
+        }
+        return scores
+
+    def _individual_layerwise_score(self, name: str, activation: torch.Tensor):
+        act = activation[..., 0]
+        grad = activation[..., 1]
+
+        act_centered = act - self.means["trusted"][name]
+        score_I = torch.einsum("bd,bd->b", grad, act_centered)
+        grad_transformed = (
+            grad @ self.projector_half_A["trusted"][name]
+        )  # (batch, dim), (dim, k) -> (batch, k)
+        act_transformed = (
+            act_centered @ self.projector_half_G["trusted"][name]
+        )  # (batch, dim), (dim, k) -> (batch, k)
+        score_P = torch.einsum("bd,bd->b", grad_transformed, act_transformed)
+
+        score = (score_I - score_P) ** 2
+
+        print("")
+        print(
+            "act_centered norm = "
+            f"{torch.linalg.norm(act_centered, ord=2, dim=-1).mean()}"
+        )
+        print(
+            "act_transformed norm = "
+            f"{torch.linalg.norm(act_transformed, ord=2, dim=-1).mean()}"
+        )
+        print(f"grad norm = {torch.linalg.norm(grad, ord=2, dim=-1).mean()}")
+        print(
+            f"grad_transformed norm = "
+            f"{torch.linalg.norm(grad_transformed, ord=2, dim=-1).mean()}"
+        )
+        print(f"mean score_I = {score_I.mean()}")
+        print(f"mean score_P = {score_P.mean()}")
+        print(f"mean score = {score.mean()}")
+
+        return score
+
+    def _get_trained_variables(self):
+        return {
+            "means": self.means,
+            "projector_half_A": self.projector_half_A,
+            "projector_half_G": self.projector_half_G,
+        }
+
+    def _set_trained_variables(self, variables):
+        self.means = variables["means"]
+        self.projector_half_A = variables["projector_half_A"]
+        self.projector_half_G = variables["projector_half_G"]
+
+    def post_covariance_training(self, **kwargs):
+        pass
+
+    def _train(self, trusted_dataloader, untrusted_dataloader, **kwargs):
+        super()._train(
+            trusted_dataloader=trusted_dataloader,
+            untrusted_dataloader=untrusted_dataloader,
+            **kwargs,
+        )
+
+        # Post process
+        with torch.inference_mode():
+            self.means = self._means
+            self.update_projection_matrices("trusted")
+            self.covariances = {}
+            for case, Cs in self._Cs.items():
+                self.covariances[case] = {
+                    k: C / (self._ns[case][k] - 1) for k, C in Cs.items()
+                }
+                if any(
+                    torch.count_nonzero(C) == 0 for C in self.covariances[case].values()
+                ):
+                    raise RuntimeError("All zero covariance matrix detected.")
             self.post_covariance_training(**kwargs)

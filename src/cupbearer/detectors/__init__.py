@@ -1,7 +1,13 @@
 # ruff: noqa: F401
 from .activation_based import ActivationBasedDetector
 from .anomaly_detector import AnomalyDetector
-from .extractors import ActivationExtractor, FeatureCache, FeatureExtractor
+from .extractors import (
+    ActivationExtractor,
+    BasisInvariantAttributionFeatureExtractor,
+    FeatureCache,
+    FeatureExtractor,
+    GradientFeatureExtractor,
+)
 from .feature_model import (
     VAE,
     FeatureModelDetector,
@@ -11,6 +17,7 @@ from .feature_model import (
 )
 from .finetuning import FinetuningAnomalyDetector
 from .statistical import (
+    BasisInvariantAttributionDetector,
     MahalanobisDetector,
     QuantumEntropyDetector,
     SpectralSignatureDetector,

@@ -1,20 +1,9 @@
 import torch
 
-from cupbearer.detectors.statistical.helpers import mahalanobis
+from cupbearer.detectors.statistical.helpers import _pinv, mahalanobis
 from cupbearer.detectors.statistical.statistical import (
     ActivationCovarianceBasedDetector,
 )
-
-
-def _pinv(C, rcond, dtype=torch.float64):
-    # Workaround for pinv not being supported on MPS
-    if C.is_mps:
-        return (
-            torch.linalg.pinv(C.cpu().to(dtype), rcond=rcond, hermitian=True)
-            .to(C.dtype)
-            .to(C.device)
-        )
-    return torch.linalg.pinv(C.to(dtype), rcond=rcond, hermitian=True).to(C.dtype)
 
 
 class MahalanobisDetector(ActivationCovarianceBasedDetector):

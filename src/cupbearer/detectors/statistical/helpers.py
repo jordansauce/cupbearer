@@ -3,6 +3,17 @@ from typing import Optional
 import torch
 
 
+def _pinv(C, rcond, dtype=torch.float64):
+    # Workaround for pinv not being supported on MPS
+    if C.is_mps:
+        return (
+            torch.linalg.pinv(C.cpu().to(dtype), rcond=rcond, hermitian=True)
+            .to(C.dtype)
+            .to(C.device)
+        )
+    return torch.linalg.pinv(C.to(dtype), rcond=rcond, hermitian=True).to(C.dtype)
+
+
 def update_covariance(curr_mean, curr_C, curr_n, new_data):
     # Should be (batch, dim)
     assert new_data.ndim == 2
@@ -23,18 +34,6 @@ def update_covariance(curr_mean, curr_C, curr_n, new_data):
     )
 
     return updated_mean, updated_C, total_n
-
-
-def batch_covariance(batches):
-    dim = batches[0].shape[1]
-    mean = torch.zeros(dim)
-    C = torch.zeros((dim, dim))
-    n = 0
-
-    for batch in batches:
-        mean, C, n = update_covariance(mean, C, n, batch)
-
-    return mean, C / (n - 1)  # Apply Bessel's correction for sample covariance
 
 
 def mahalanobis(

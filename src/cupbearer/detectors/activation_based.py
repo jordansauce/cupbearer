@@ -27,6 +27,10 @@ class ActivationBasedDetector(AnomalyDetector):
         processed_names: list[str] | None = None,
         layer_aggregation: str = "mean",
         cache: FeatureCache | None = None,
+        get_grads: bool = False,
+        output_func_for_grads: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        act_grad_combination_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
     ):
         if feature_extractor is None:
             if activation_names is None:
@@ -40,6 +44,9 @@ class ActivationBasedDetector(AnomalyDetector):
                 global_processing_fn=global_processing_fn,
                 processed_names=processed_names,
                 cache=cache,
+                get_grads=get_grads,
+                output_func_for_grads=output_func_for_grads,
+                act_grad_combination_func=act_grad_combination_func,
             )
         super().__init__(
             feature_extractor=feature_extractor, layer_aggregation=layer_aggregation

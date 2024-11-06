@@ -19,7 +19,12 @@ class ActivationExtractor(FeatureExtractor):
         | None = None,
         processed_names: list[str] | None = None,
         cache: FeatureCache | None = None,
+        get_grads: bool = False,
+        output_func_for_grads: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        act_grad_combination_func: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
     ):
+        """Get activations from a model"""
         # global_processing_fn might return a dict with different keys than the names
         # of raw activations. In that case, the user should pass in processed_names
         # with a list of the names that global_processing_fn returns, whereas names
@@ -38,8 +43,30 @@ class ActivationExtractor(FeatureExtractor):
             cache=cache,
         )
         self.names = names
+        self.get_grads = get_grads
+        self.output_func_for_grads = output_func_for_grads
+        self.act_grad_combination_func = act_grad_combination_func
+
+        # if self.get_grads:
+        #     for name in self.names:
+        #         if name.endswith(".input") or name.endswith(".output"):
+        #             grad_name = name + "_grad"
+        #             if grad_name not in self.names:
+        #                 self.names.append(grad_name)
 
     def compute_features(self, inputs: Any) -> dict[str, torch.Tensor]:
         if self.model is None:
             raise ValueError("Model not set. Call set_model() first.")
-        return utils.get_activations(inputs, model=self.model, names=self.names)
+        if self.get_grads:
+            assert (
+                self.output_func_for_grads is not None
+            ), "output_func_for_grads must be provided when get_grads is True"
+            return utils.get_activations_and_grads(
+                inputs,
+                model=self.model,
+                names=self.names,
+                output_func_for_grads=self.output_func_for_grads,
+                act_grad_combination_func=self.act_grad_combination_func,
+            )
+        else:
+            return utils.get_activations(inputs, model=self.model, names=self.names)
