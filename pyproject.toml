@@ -28,6 +28,7 @@ dependencies = [
     "tqdm",
     "loguru",
     "matplotlib",
+    "pyod>=2.0", # For the TED detector
 ]
 
 requires-python = ">=3.10"
