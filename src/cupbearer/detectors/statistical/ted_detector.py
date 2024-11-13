@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Literal, Union
 
 import torch
 from pyod.models.pca import PCA
@@ -36,13 +36,21 @@ class TEDDetector(StatisticalDetector):
         contamination: float = 0.1,
         normalize_ranks: bool = False,
         score_aggregation: str = "mean",
+        store_acts_on_cpu: bool = True,
+        sequence_dim_as_batch: bool = False,
+        max_seq_len: Union[int, None] = None,
+        truncate_seq_at: Literal["start", "end"] = "start",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.n_neighbors = n_neighbors
         self.contamination = contamination
         self.normalize_ranks = normalize_ranks
+        self.sequence_dim_as_batch = sequence_dim_as_batch
         self.score_aggregation = score_aggregation
+        self.store_acts_on_cpu = store_acts_on_cpu
+        self.max_seq_len = max_seq_len
+        self.truncate_seq_at = truncate_seq_at
 
         # Storage for training state
         self.clean_activations = {}  # Layer name -> List[Tensor]
@@ -55,6 +63,10 @@ class TEDDetector(StatisticalDetector):
         # Initialize empty lists to store activations from each layer
         self.clean_activations = {
             layer_name: [] for layer_name in example_activations.keys()
+        }
+
+        self.max_seq_len_seen = {
+            layer_name: 0 for layer_name in example_activations.keys()
         }
 
         # Counter for number of samples seen
@@ -73,7 +85,13 @@ class TEDDetector(StatisticalDetector):
         # Note: The positions in these lists implicitly track which
         # activations came from the same sample
         for layer_name, activation in activations.items():
-            self.clean_activations[layer_name].append(activation.cpu())
+            if activation.ndim == 3:
+                self.max_seq_len_seen[layer_name] = max(
+                    self.max_seq_len_seen[layer_name], activation.size(1)
+                )
+            if self.store_acts_on_cpu:
+                activation = activation.cpu()
+            self.clean_activations[layer_name].append(activation)
 
         # Update sample counter
         self._ns[case] += next(iter(activations.values())).size(0)
@@ -115,8 +133,6 @@ class TEDDetector(StatisticalDetector):
         Returns:
             Rankings of shape (n_queries, k)
         """
-        query = query.to(torch.float32)
-        reference = reference.to(torch.float32)
 
         # Normalize for cosine similarity
         query_norm = torch.nn.functional.normalize(query, p=2, dim=1)
@@ -149,13 +165,60 @@ class TEDDetector(StatisticalDetector):
 
         return neighbor_rankings
 
+    def _prepare_activation(
+        self, activation: torch.Tensor, layer_name: str
+    ) -> torch.Tensor:
+        """Prepare activations for storage.
+
+        For transformer models, activations will typically have shape:
+        (batch_size, sequence_length, hidden_dim)
+        """
+        act = activation.clone().detach()
+
+        # If we have a sequence dimension
+        if act.ndim > 2:
+            # Reverse sequence if needed
+            if self.truncate_seq_at == "start":
+                act = act.flip(1)
+            # Truncate sequence if needed
+            if self.max_seq_len is not None:
+                max_seq_len = min(self.max_seq_len, self.max_seq_len_seen[layer_name])
+            else:
+                max_seq_len = self.max_seq_len_seen[layer_name]
+            if act.size(1) > max_seq_len:
+                act = act[:, :max_seq_len, :]
+            else:  # Pad with zeros otherwise
+                pad_size = max_seq_len - act.size(1)
+                act = torch.cat(
+                    [
+                        act,
+                        torch.zeros(
+                            act.size(0), pad_size, act.size(2), device=act.device
+                        ),
+                    ],
+                    dim=1,
+                )
+
+            if self.sequence_dim_as_batch:
+                # Flatten sequence into batch dimension
+                act = act.reshape(-1, activation.size(-1))
+            else:
+                # Flatten sequence into hidden dimension
+                act = act.reshape(activation.size(0), -1)
+        return act.to(float)
+
     def _finalize_training(self, **kwargs):
         """Create PCA outlier detectors for each reference layer."""
         # Stack stored activations for each layer
         for layer_name in self.clean_activations:
+            for i in range(len(self.clean_activations[layer_name])):
+                self.clean_activations[layer_name][i] = self._prepare_activation(
+                    self.clean_activations[layer_name][i], layer_name
+                )
+
             self.clean_activations[layer_name] = torch.cat(
                 self.clean_activations[layer_name], dim=0
-            ).view(-1, self.clean_activations[layer_name][0].size(-1))
+            )
 
         layer_names = list(self.clean_activations.keys())
 
@@ -221,11 +284,15 @@ class TEDDetector(StatisticalDetector):
         batch_size = example_features.size(0)
         layer_names = list(features.keys())
 
+        prepared_features = {}
+        for layer in layer_names:
+            prepared_features[layer] = self._prepare_activation(features[layer], layer)
+
         # Compute scores using each layer as reference
         all_scores = {}
         for ref_layer in layer_names:
             # Prepare query activations (combine batch and sequence dims)
-            query = features[ref_layer].view(-1, features[ref_layer].size(-1))
+            query = prepared_features[ref_layer]
             clean_ref = self.clean_activations[ref_layer].to(device)
 
             # Find k nearest neighbors in reference layer
@@ -240,7 +307,7 @@ class TEDDetector(StatisticalDetector):
                 for layer in layer_names:
                     if layer != ref_layer:
                         # Get rankings in this layer
-                        layer_query = features[layer].view(-1, features[layer].size(-1))
+                        layer_query = prepared_features[layer]
                         layer_clean = self.clean_activations[layer].to(device)
                         rankings = self._get_neighbor_rankings(
                             query=layer_query,
